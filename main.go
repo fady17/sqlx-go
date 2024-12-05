@@ -15,7 +15,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-	"github.com/gofiber/template/html/v2"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -423,18 +422,21 @@ func (dc *DatabaseClient) Close() error {
     return nil
 }
 
-
 func NewStoreRepository(db *DatabaseClient, logger *Logger) (*StoreRepository, error) {
-    getStoreByIDStmt := `
-        SELECT 
-            id, 
-            name, 
-            contact, 
-            open_at, 
-            close_at 
-        FROM store
-        WHERE id = @store_id
-    `
+	getStoreByIDStmt := `
+	SELECT 
+		id, 
+		name, 
+		contact, 
+		open_at, 
+		close_at,
+		CASE 
+                WHEN NOW() BETWEEN open_at AND close_at THEN 'open'
+                ELSE 'closed'
+            END AS status 
+	FROM store
+	WHERE id = @store_id
+`
 
     getStoresStmt := `
         SELECT 
@@ -442,19 +444,26 @@ func NewStoreRepository(db *DatabaseClient, logger *Logger) (*StoreRepository, e
             name, 
             contact, 
             open_at, 
-            close_at 
+            close_at,
+            CASE 
+                WHEN NOW() BETWEEN open_at AND close_at THEN 'open'
+                ELSE 'closed'
+            END AS status
         FROM store
         ORDER BY name
-        LIMIT @limit OFFSET @offset
+        LIMIT $1 OFFSET $2
     `
-
+    
     return &StoreRepository{
-        db:               db,
-        logger:           logger,
-        getStoreByIDStmt: getStoreByIDStmt,
-        getStoresStmt:    getStoresStmt,
+        db:     db,
+        logger: logger,
+		getStoreByIDStmt: getStoreByIDStmt,
+        getStoresStmt: getStoresStmt,
     }, nil
 }
+
+
+
 
 func (r *StoreRepository) GetStores(ctx context.Context, limit, offset int) ([]Store, error) {
 	args := pgx.NamedArgs{
@@ -473,7 +482,8 @@ func (r *StoreRepository) GetStores(ctx context.Context, limit, offset int) ([]S
 	}
 	defer rows.Close()
 
-	var stores []Store
+	stores := make([]Store, 0, limit)
+	// var stores []Store
 	for rows.Next() {
 		var store Store
 		if err := rows.Scan(
@@ -482,13 +492,14 @@ func (r *StoreRepository) GetStores(ctx context.Context, limit, offset int) ([]S
 			&store.Contact, 
 			&store.OpenAt, 
 			&store.CloseAt,
+			&store.Status,
 		); err != nil {
 			r.logger.Error("Failed to scan store data", zap.Error(err))
 			return nil, err
 		}
 		
-		// Set the status programmatically for each store
-		store.Status = getStatus(store.OpenAt.Time, store.CloseAt.Time)
+		
+		
 		stores = append(stores, store)
 	}
 
@@ -513,6 +524,7 @@ func (r *StoreRepository) GetStoreByID(ctx context.Context, storeID int64) (*Sto
 		&store.Contact,
 		&store.OpenAt,
 		&store.CloseAt,
+		&store.Status,
 	)
 
 	if err != nil {
@@ -526,20 +538,12 @@ func (r *StoreRepository) GetStoreByID(ctx context.Context, storeID int64) (*Sto
 		return nil, err
 	}
 
-	// Calculate status programmatically
-	store.Status = getStatus(store.OpenAt.Time, store.CloseAt.Time)
+	
 
 	return &store, nil
 }
 
-// Adjust getStatus to use time.Time directly
-func getStatus(openAt, closeAt time.Time) string {
-    now := time.Now()
-    if now.Before(openAt) || now.After(closeAt) {
-        return "closed"
-    }
-    return "open"
-}
+
 
 
 func main() {
@@ -577,13 +581,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize standard Go html template engine
-    engine := html.New("./views", ".html")
-
+	
 
 	// Create Fiber app
 	app := fiber.New(fiber.Config{
-		Views: 					engine,
+		
 		AppName:               "176org",
 		ServerHeader:          "176org",
 		DisableStartupMessage: false,
@@ -682,30 +684,49 @@ func main() {
 		offset := (page - 1) * limit
 
 		// Fetch stores with pagination
-		stores, err := storeRepo.GetStores(ctx, limit, offset)
-		if err != nil {
-			appLogger.Error("Failed to retrieve stores",
-				zap.Error(err),
-			)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to retrieve stores",
-			})
-		}
+		storeChan := make(chan []Store, 1)
+    errChan := make(chan error, 1)
 
-		if len(stores) == 0 {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-				"error": "No stores found",
-			})
-		}
+    go func() {
+        stores, err := storeRepo.GetStores(ctx, limit, offset)
+        if err != nil {
+            errChan <- err
+            return
+        }
+        storeChan <- stores
+    }()
 
-		// Return the list of stores
-		// Prepare data to be rendered
-	data := map[string]interface{}{
-		"Stores": stores, // Pass the list of stores to the template
-	}
+    // Wait for result with timeout
+    select {
+    case stores := <-storeChan:
+        if len(stores) == 0 {
+            return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+                "message": "No stores found",
+                "total":   0,
+            })
+        }
 
-	// Return the list of stores
-	return c.Render("index", data)
+        // Optimized response with pagination metadata
+        return c.JSON(fiber.Map{
+            "stores": stores,
+            "pagination": fiber.Map{
+                "page":  page,
+                "limit": limit,
+                "total": len(stores),
+            },
+        })
+
+    case err := <-errChan:
+        appLogger.Error("Failed to retrieve stores", zap.Error(err))
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+            "error": "Failed to retrieve stores",
+        })
+
+    case <-ctx.Done():
+        return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
+            "error": "Request timed out",
+        })
+    }
 })
 
 
